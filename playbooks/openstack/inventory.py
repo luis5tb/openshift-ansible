@@ -9,6 +9,7 @@ environment.
 
 from __future__ import print_function
 
+from collections import defaultdict
 from collections import Mapping
 import json
 import os
@@ -37,6 +38,13 @@ def base_openshift_inventory(cluster_hosts):
            if server.metadata['host-type'] == 'node' and
            server.metadata['sub-host-type'] == 'app']
 
+    bm_app_hosts = [server for server in cluster_hosts
+              if server.metadata['host-type'] == 'node' and
+              server.metadata['sub-host-type'] == 'bm_app']
+    _update_bm_app_with_kubelet_port(bm_app_hosts, cloud.list_ports())
+    bm_app = [bm_app_host.name for bm_app_host in bm_app_hosts]
+    app.extend(bm_app)
+
     cns = [server.name for server in cluster_hosts
            if server.metadata['host-type'] == 'cns']
 
@@ -57,6 +65,7 @@ def base_openshift_inventory(cluster_hosts):
     inventory['nodes'] = {'hosts': nodes}
     inventory['infra_hosts'] = {'hosts': infra_hosts}
     inventory['app'] = {'hosts': app}
+    inventory['bm_app'] = {'hosts': bm_app}
     inventory['glusterfs'] = {'hosts': cns}
     inventory['dns'] = {'hosts': dns}
     inventory['lb'] = {'hosts': load_balancers}
@@ -100,6 +109,8 @@ def _get_hostvars(server, docker_storage_mountpoints):
         # performance issues.
         hostvars['openshift_hostname'] = server.metadata.get(
             'openshift_hostname', server.private_v4)
+    if hasattr(server, 'kubelet_port_name'):
+        hostvars['kubelet_port_name'] = server.kubelet_port_name
     hostvars['openshift_public_hostname'] = server.name
 
     if server.metadata['host-type'] == 'cns':
@@ -231,6 +242,25 @@ def _get_kuryr_vars(cloud_client, data):
             cloud_client.auth['project_domain_name'])
     return settings
 
+def _update_bm_app_with_kubelet_port(hosts, ports):
+    names = set([host['name'] for host in hosts])
+    agent_names = dict([(host['metadata']['neutron_agent_name'], host['name'])
+                        for host in hosts if 'neutron_agent_name' in
+                        host['metadata']])
+    bm_ports = defaultdict(list)
+    for port in ports:
+        port_host = port['binding:host_id']
+        if port_host in names:
+            bm_ports[port_host].append(port)
+        elif port_host in agent_names:
+            bm_ports[agent_names[port_host]].append(port)
+
+    for host in hosts:
+        host_bound_ports = bm_ports[host['name']]
+        kubelet_port, = [port for port in host_bound_ports if 'kubelet' in
+                         port['name']]
+        host['private_v4'] = kubelet_port['fixed_ips'][0]['ip_address']
+        host['kubelet_port_name'] = kubelet_port['name']
 
 if __name__ == '__main__':
     print(json.dumps(build_inventory(), indent=4, sort_keys=True))

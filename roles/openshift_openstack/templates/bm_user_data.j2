@@ -1,0 +1,73 @@
+#cloud-config
+disable_root: true
+
+system_info:
+  default_user:
+    name: openshift
+    sudo: ["ALL=(ALL) NOPASSWD: ALL"]
+
+write_files:
+  - path: /usr/sbin/ifup-local
+    permissions: 0770
+    content: |
+      #!/bin/bash
+      ORIGIN_DNS='/etc/origin/node/resolv.conf'
+
+      DEVICE="$1"
+      if [[ "$DEVICE" == "kubelet" ]]; then
+          . "/etc/sysconfig/network-scripts/ifcfg-${DEVICE}"
+          NEW_RESOLV="$(mktemp)"
+          echo "nameserver ${DNS1}" >> "$NEW_RESOLV"
+          echo "nameserver ${DNS2}" >> "$NEW_RESOLV"
+          mkdir -p "$(dirname ${ORIGIN_DNS})"
+          cp "$NEW_RESOLV" "$ORIGIN_DNS"
+          restorecon "$ORIGIN_DNS"
+      fi
+  - path: /etc/sysconfig/network-scripts/ifcfg-kubelet
+    permissions: 0664
+    content: |
+      DEVICE=kubelet
+      ONBOOT=yes
+      HOTPLUG=no
+      NM_CONTROLLED=yes
+      DEVICETYPE=ovs
+      TYPE=OVSIntPort
+      OVS_BRIDGE=br-int
+      OVS_EXTRA="set Interface ${DEVICE} external-ids:iface-status=active -- set Interface ${DEVICE} external-ids:attached-mac=__kubelet_mac_addr__ -- set Interface ${DEVICE} external-ids:iface-id=__kubelet_port_uuid__"
+      MACADDR=__kubelet_mac_addr__
+      BOOTPROTO=static
+      IPADDR=__kubelet_ip__
+      PREFIX=__kubelet_prefix__
+      PEERDNS=yes
+      DNS1=__kubelet_dns1__
+      DNS2=__kubelet_dns2__
+  - path: /etc/sysconfig/network-scripts/route-kubelet
+    permissions: 0664
+    content: |
+      __pod_subnet_cidr__ via __kubelet_gateway__ dev kubelet
+  - path: /usr/local/bin/bm_node_reconfigure
+    permissions: 0550
+    content: |
+      #!/bin/bash -xv
+      sed -i -e s#__internal_api_ip_cidr__#__api_ip_cidr__#g \
+             -e s#__tenant_vxlan_ip_cidr__#__vxlan_ip_cidr__#g \
+             -e s#__provisioning_ip_cidr__#__instance_ip_cidr__#g \
+          /etc/os-net-config/baremetal_config.yaml
+      os-net-config -c /etc/os-net-config/baremetal_config.yaml
+      sed -i -e s#__tenant_vxlan_ip_cidr__#__vxlan_ip__#g \
+          /etc/neutron/plugins/ml2/openvswitch_agent.ini
+      restorecon /etc/neutron/plugins/ml2/openvswitch_agent.ini
+      sed -i -e "s/__hostname__/__kubelet_ip__)/g" \
+          /etc/neutron/neutron.conf
+      restorecon /etc/neutron/neutron.conf
+      echo "__instance_ip__ $(hostname)" >> /etc/hosts
+      systemctl restart neutron-openvswitch-agent.service
+  - path: /etc/sudoers.d/00-openshift-no-requiretty
+    permissions: 0440
+    content: |
+      Defaults:openshift !requiretty
+
+runcmd:
+  - [sudo, /usr/local/bin/bm_node_reconfigure]
+  - [sudo, systemctl, disable, neutron-ovs-cleanup]
+  - [sudo, systemctl, restart, network.service]

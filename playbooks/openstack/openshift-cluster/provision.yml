@@ -2,6 +2,16 @@
 - name: Create the OpenStack resources for cluster installation
   import_playbook: provision_resources.yml
 
+- hosts: bm_app
+  become: no
+  gather_facts: no
+  tasks:
+  - name: Update the port binding host id to match its ip
+    command: python update_binding_host_id.py {{ inventory_hostname }}
+    delegate_to: localhost
+    retries: 10
+    register: update_port
+    until: update_port is succeeded
 
 # NOTE(shadower): Bring in the host groups:
 - name: evaluate groups
@@ -22,6 +32,31 @@
   - name: Gather facts for the new nodes
     setup:
 
+- hosts: bm_app
+  become: no
+  gather_facts: no
+  tasks:
+  - name: Wait for cloud-init to finish
+    command: systemctl show cloud-init --property SubState,ActiveState
+    become: yes
+    retries: 10
+    register: result
+    ignore_errors: yes
+    until: ('ActiveState=active' in result.stdout) and ('SubState=exited' in result.stdout)
+
+  - name: Wait until the host runs the neutron agent
+    command: python agents.py {{ inventory_hostname }}
+    delegate_to: localhost
+    retries: 10
+    register: agent_list
+    until: agent_list is succeeded
+
+  - name: Update the port
+    os_port:
+      state: present
+      name: "{{ kubelet_port_name }}"
+      device_owner: compute:shiftstack
+    delegate_to: localhost
 
 # TODO(shadower): consider splitting this up so people can stop here
 # and configure their DNS if they have to.

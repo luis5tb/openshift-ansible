@@ -69,6 +69,18 @@ parameters:
 {% endif %}
 
 {% if openshift_use_kuryr|default(false)|bool %}
+  kubelet_net:
+    type: string
+    label: Kubelet Net ID
+    description: Net resource
+    default: ''
+
+  kubelet_subnet:
+    type: string
+    label: Kubelet Subnet ID
+    description: Subnet resource
+    default: ''
+
   pod_net:
     type: string
     label: Pod Net ID
@@ -79,6 +91,12 @@ parameters:
     type: string
     label: Pod Subnet ID
     description: Subnet resource
+    default: ''
+
+  pod_subnet_cidr:
+    type: string
+    label: Pod Subnet CIDR
+    description: Subnet CIDR
     default: ''
 {% endif %}
 
@@ -200,11 +218,14 @@ outputs:
         - addr
 
 conditions:
-  no_floating: {not: { get_param: attach_float_net} }
+  no_floating: {or: [{not: { get_param: attach_float_net} }, { equals: [{ get_param: subtype }, 'bm_app'] }] }
 {% if openshift_use_flannel|default(False)|bool %}
   no_data_subnet: {not: { get_param: attach_data_net} }
 {% endif %}
-
+  bm_app_node:
+    equals:
+      - get_param: subtype
+      - bm_app
 
 resources:
 
@@ -225,22 +246,81 @@ resources:
 
 {% else %}
 {% if use_trunk_ports|default(False)|bool %}
-        - port:  { get_attr: [trunk_port, port_id]}
+        if:
+        - bm_app_node:
+        - - port:  { get_resource: port }
+        - - port:  { get_attr: [trunk_port, port_id]}
 {% else %}
         - port:  { get_resource: port }
 {% endif %}
 {% endif %}
       user_data:
-        get_file: user-data
+        if:
+        - bm_app_node
+        - str_replace:
+            template:
+              get_file: bm-user-data
+            params:
+              __api_ip_cidr__:
+                list_join:
+                - ''
+                - - { get_attr: [bm_api_port, fixed_ips, 0, ip_address] }
+                  - '/'
+                  - str_split:
+                    - '/'
+                    - get_attr: [bm_api_port, subnets, 0, cidr]
+                    - 1
+              __vxlan_ip_cidr__:
+                list_join:
+                - ''
+                - - { get_attr: [bm_vxlan_port, fixed_ips, 0, ip_address] }
+                  - '/'
+                  - str_split:
+                    - '/'
+                    - get_attr: [bm_vxlan_port, subnets, 0, cidr]
+                    - 1
+              __instance_ip_cidr__:
+                list_join:
+                - ''
+                - - { get_attr: [port, fixed_ips, 0, ip_address] }
+                  - '/'
+                  - str_split:
+                    - '/'
+                    - get_attr: [port, subnets, 0, cidr]
+                    - 1
+              __vxlan_ip__: { get_attr: [bm_vxlan_port, fixed_ips, 0, ip_address] }
+              __instance_ip__: { get_attr: [port, fixed_ips, 0, ip_address] }
+              __kubelet_ip__: { get_attr: [bm_kubelet_port, fixed_ips, 0, ip_address] }
+              __kubelet_prefix__:
+                str_split:
+                - '/'
+                - get_attr: [bm_kubelet_port, subnets, 0, cidr]
+                - 1
+              __kubelet_mac_addr__: { get_attr: [bm_kubelet_port, mac_address] }
+              __kubelet_port_uuid__: { get_resource: bm_kubelet_port }
+              __kubelet_gateway__: { get_attr: [bm_kubelet_port, subnets, 0, gateway_ip] }
+              __kubelet_dns1__: { get_attr: [bm_kubelet_port, subnets, 0, dns_nameservers, 0] }
+              __kubelet_dns2__: { get_attr: [bm_kubelet_port, subnets, 0, dns_nameservers, 1] }
+              __pod_subnet_cidr__: { get_param: pod_subnet_cidr }
+        - get_file: user-data
       user_data_format: RAW
       user_data_update_policy: IGNORE
       metadata:
-        group: { get_param: group }
-        environment: { get_param: cluster_env }
-        clusterid: { get_param: cluster_id }
-        host-type: { get_param: type }
-        sub-host-type:    { get_param: subtype }
-        node_labels: { get_param: node_labels }
+        if:
+        - bm_app_node
+        - group: { get_param: group }
+          environment: { get_param: cluster_env }
+          clusterid: { get_param: cluster_id }
+          host-type: { get_param: type }
+          sub-host-type: { get_param: subtype }
+          node_labels: { get_param: node_labels }
+          neutron_agent_name: { get_attr: [bm_kubelet_port, fixed_ips, 0, ip_address] }
+        - group: { get_param: group }
+          environment: { get_param: cluster_env }
+          clusterid: { get_param: cluster_id }
+          host-type: { get_param: type }
+          sub-host-type: { get_param: subtype }
+          node_labels: { get_param: node_labels }
 {% if openshift_openstack_dns_nameservers %}
         openshift_hostname: { get_param: name }
 {% endif %}
@@ -249,6 +329,7 @@ resources:
 {% if use_trunk_ports|default(false)|bool %}
   trunk_port:
     type: OS::Neutron::Trunk
+    condition: { not: bm_app_node }
     properties:
       name: { get_param: name }
       port: { get_resource: port }
@@ -266,11 +347,13 @@ resources:
 
   segmentation:
     type: segmentation_ids.yaml
+    condition: { not: bm_app_node }
     properties:
       number_of_vlan_ids: {{ openshift_kuryr_precreate_subports }}
 
   subports:
     type: OS::Heat::ResourceGroup
+    condition: { not: bm_app_node }
     properties:
       count: {{ openshift_kuryr_precreate_subports }}
       resource_def:
@@ -305,6 +388,33 @@ resources:
 {% endif %}
 {% endif %}
 
+  bm_api_port:
+    type: OS::Neutron::Port
+    condition: bm_app_node
+    properties:
+      network: {{ openshift_openstack_baremetal_api_net }}
+      fixed_ips:
+        - subnet: {{ openshift_openstack_baremetal_api_subnet }}
+
+  bm_vxlan_port:
+    type: OS::Neutron::Port
+    condition: bm_app_node
+    properties:
+      network: {{ openshift_openstack_baremetal_vxlan_net }}
+      fixed_ips:
+        - subnet: {{ openshift_openstack_baremetal_vxlan_subnet }}
+
+  bm_kubelet_port:
+    type: OS::Neutron::Port
+    condition: bm_app_node
+    properties:
+      network: { get_param: kubelet_net }
+      fixed_ips:
+        - subnet: { get_param: kubelet_subnet }
+      security_group: { get_param: secgrp }
+      value_specs:
+        "binding:host_id": { get_param: name }
+
 {% if not openshift_openstack_provider_network_name %}
   floating-ip:
     condition: { not: no_floating }
@@ -317,6 +427,7 @@ resources:
 {% if not openshift_openstack_ephemeral_volumes|default(false)|bool %}
   cinder_volume:
     type: OS::Cinder::Volume
+    condition: { not: bm_app_node }
     properties:
       size: { get_param: volume_size }
       availability_zone: { get_param: availability_zone }
@@ -325,6 +436,7 @@ resources:
 
   volume_attachment:
     type: OS::Cinder::VolumeAttachment
+    condition: { not: bm_app_node }
     properties:
       volume_id: { get_resource: cinder_volume }
       instance_uuid: { get_resource: server }
